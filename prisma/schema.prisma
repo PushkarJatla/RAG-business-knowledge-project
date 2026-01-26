@@ -1,0 +1,73 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+
+
+model User {
+  id            String         @id @default(uuid())
+  email         String?        @unique
+  name          String?
+  created_at    DateTime       @default(now())
+
+  conversations Conversation[]
+  documents     Document[]
+}
+
+model Conversation {
+  id            String      @id @default(uuid())
+  title         String?
+  created_at    DateTime    @default(now())
+
+  user_id       String
+  user          User        @relation(fields: [user_id], references: [id])
+
+  messages      Message[]
+  memory        ConversationMemory?
+}
+
+model Message {
+  id               String       @id @default(uuid())
+  role             String
+  content          String
+  created_at       DateTime     @default(now())
+
+  conversation_id  String
+  conversation     Conversation @relation(fields: [conversation_id], references: [id])
+}
+
+model Document {
+  id           String          @id @default(uuid())
+  name         String?
+  type         String?
+  created_at   DateTime        @default(now())
+
+  user_id      String
+  user         User            @relation(fields: [user_id], references: [id])
+
+  chunks       DocumentChunk[]
+}
+
+model DocumentChunk {
+  id          String    @id @default(uuid())
+  content     String
+  embedding   Unsupported("vector(1536)")
+  created_at  DateTime  @default(now())
+
+  document_id String
+  document    Document @relation(fields: [document_id], references: [id])
+}
+
+model ConversationMemory {
+  id               String       @id @default(uuid())
+  summary          String?
+  updated_at       DateTime     @default(now())
+
+  conversation_id  String       @unique
+  conversation     Conversation @relation(fields: [conversation_id], references: [id])
+}
