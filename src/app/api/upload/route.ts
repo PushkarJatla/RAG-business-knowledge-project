@@ -1,174 +1,294 @@
 import { NextResponse } from "next/server"
 import { prisma } from "@/lib/prisma"
+import { SectionType } from "@prisma/client"
 
-// -----------------------------
-// Utils
-// -----------------------------
+export const runtime = "nodejs"
+
+// --------------------------------------------------
+// TEXT CLEANING
+// --------------------------------------------------
+
 function cleanPdfText(text: string) {
-  return text
-    .replace(/\r\n/g, "\n")
-    .replace(/\t+/g, " ")
-    .replace(/ +/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim()
+    return text
+        .replace(/\r\n/g, "\n")
+        .replace(/\t+/g, " ")
+        .replace(/([a-z])([A-Z])/g, "$1 $2")
+        .replace(/(\d)([A-Za-z])/g, "$1 $2")
+        .replace(/([A-Za-z])(\d)/g, "$1 $2")
+        .replace(/ +/g, " ")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim()
 }
 
-/**
- * Semantic chunking:
- * - No word breaks
- * - Sentence-aware
- * - Embedding friendly
- */
-function chunkText(text: string, maxLength = 400) {
-  const normalized = text
-    .replace(/\n+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
+// --------------------------------------------------
+// HEADING DETECTION
+// --------------------------------------------------
 
-  const sentences = normalized.split(/(?<=[.!?])\s+/)
+function isHeading(line: string) {
+    const trimmed = line.trim()
 
-  const chunks: string[] = []
-  let current = ""
+    return (
+        trimmed.length > 2 &&
+        trimmed.length < 50 &&
+        trimmed === trimmed.toUpperCase() &&
+        !trimmed.includes(".") &&
+        !trimmed.includes(",")
+    )
+}
 
-  for (const sentence of sentences) {
-    // Very long sentence → split by words safely
-    if (sentence.length > maxLength) {
-      if (current) {
-        chunks.push(current.trim())
-        current = ""
-      }
+// --------------------------------------------------
+// SPLIT INTO RAW SECTIONS
+// --------------------------------------------------
 
-      let temp = ""
-      for (const word of sentence.split(" ")) {
-        if ((temp + " " + word).length > maxLength) {
-          chunks.push(temp.trim())
-          temp = word
+function splitIntoSections(text: string) {
+    const lines = text.split("\n")
+
+    const sections: { heading: string; content: string }[] = []
+
+    let currentHeading = "GENERAL"
+    let buffer: string[] = []
+
+    for (const rawLine of lines) {
+        const line = rawLine.trim()
+        if (!line) continue
+
+        if (isHeading(line)) {
+            if (buffer.length) {
+                sections.push({
+                    heading: currentHeading,
+                    content: buffer.join(" ").trim(),
+                })
+            }
+
+            currentHeading = line
+            buffer = []
         } else {
-          temp += " " + word
+            buffer.push(line)
         }
-      }
-      if (temp.trim()) chunks.push(temp.trim())
-      continue
     }
 
-    // Normal merge
-    if ((current + " " + sentence).length > maxLength) {
-      chunks.push(current.trim())
-      current = sentence
-    } else {
-      current += " " + sentence
+    if (buffer.length) {
+        sections.push({
+            heading: currentHeading,
+            content: buffer.join(" ").trim(),
+        })
     }
-  }
 
-  if (current.trim()) chunks.push(current.trim())
-  return chunks
+    return sections
 }
 
-// -----------------------------
-// API
-// -----------------------------
+// --------------------------------------------------
+// NORMALIZE HEADING → ENUM
+// --------------------------------------------------
+
+function normalizeHeading(heading: string): SectionType {
+    const h = heading.toLowerCase()
+
+    if (h.includes("summary") || h.includes("profile"))
+        return "SUMMARY"
+
+    if (h.includes("skill") || h.includes("technology"))
+        return "SKILLS"
+
+    if (
+        h.includes("experience") ||
+        h.includes("employment") ||
+        h.includes("work") ||
+        h.includes("internship")
+    )
+        return "EXPERIENCE"
+
+    if (
+        h.includes("project") ||
+        h.includes("academic")
+    )
+        return "PROJECTS"
+
+    if (h.includes("education"))
+        return "EDUCATION"
+
+    if (h.includes("certification"))
+        return "CERTIFICATIONS"
+
+    return "OTHER"
+}
+
+// --------------------------------------------------
+// MAIN SECTION EXTRACTOR
+// --------------------------------------------------
+
+function extractSections(text: string) {
+    const rawSections = splitIntoSections(text)
+
+    return rawSections.map(section => ({
+        type: normalizeHeading(section.heading),
+        content: section.content,
+    }))
+}
+
+// --------------------------------------------------
+// SEMANTIC CHUNKING
+// --------------------------------------------------
+
+function chunkText(text: string, maxLength = 400) {
+    const normalized = text
+        .replace(/\n+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+
+    const sentences = normalized.split(/(?<=[.!?])\s+/)
+
+    const chunks: string[] = []
+    let current = ""
+
+    for (const sentence of sentences) {
+        if ((current + " " + sentence).length > maxLength) {
+            chunks.push(current.trim())
+            current = sentence
+        } else {
+            current += " " + sentence
+        }
+    }
+
+    if (current.trim()) chunks.push(current.trim())
+
+    return chunks
+}
+
+// --------------------------------------------------
+// API ROUTE
+// --------------------------------------------------
+
 export async function POST(req: Request) {
-  const formData = await req.formData()
-  const file = formData.get("file") as File | null
+    try {
+        const formData = await req.formData()
 
-  if (!file) {
-    return NextResponse.json(
-      { success: false, error: "No file uploaded" },
-      { status: 400 }
-    )
-  }
+        let file: File | null = null
 
-  if (file.type !== "application/pdf") {
-    return NextResponse.json(
-      { success: false, error: "Only PDFs supported" },
-      { status: 400 }
-    )
-  }
+        for (const [, value] of formData.entries()) {
+            if (value instanceof File) {
+                file = value
+                break
+            }
+        }
 
-  // -----------------------------
-  // Parse PDF
-  // -----------------------------
-  const arrayBuffer = await file.arrayBuffer()
-  const buffer = Buffer.from(arrayBuffer)
+        if (!file) {
+            return NextResponse.json(
+                { error: "No file uploaded" },
+                { status: 400 }
+            )
+        }
 
-  let rawText = ""
-  let cleanText = ""
+        if (file.type !== "application/pdf") {
+            return NextResponse.json(
+                { error: "Only PDFs supported" },
+                { status: 400 }
+            )
+        }
 
-  try {
-    const parse = require("pdf-parse-fork")
-    const data = await parse(buffer)
-    rawText = data.text
-    cleanText = cleanPdfText(rawText)
-  } catch (err) {
-    console.error("PDF parse error:", err)
-    return NextResponse.json(
-      { success: false, error: "PDF parsing failed" },
-      { status: 500 }
-    )
-  }
+        // --------------------------------------------------
+        // PARSE PDF
+        // --------------------------------------------------
 
-  // -----------------------------
-  // TEMP USER (until auth)
-  // -----------------------------
-  const userId = crypto.randomUUID()
+        const arrayBuffer = await file.arrayBuffer()
+        const buffer = Buffer.from(arrayBuffer)
 
-  await prisma.user.upsert({
-    where: { email: "dev@test.com" },
-    update: {},
-    create: {
-      id: userId,
-      email: "dev@test.com",
-      name: "Dev User",
-    },
-  })
+        const parse = require("pdf-parse-fork")
+        const data = await parse(buffer)
 
-  // -----------------------------
-  // Save Document
-  // -----------------------------
-  const document = await prisma.document.create({
-    data: {
-      name: file.name,
-      type: file.type,
-      user_id: userId,
-    },
-  })
+        const rawText = data.text
+        const cleanText = cleanPdfText(rawText)
 
-  // -----------------------------
-  // Chunk & Store
-  // -----------------------------
-  const chunks = chunkText(cleanText)
+        if (!cleanText) {
+            return NextResponse.json(
+                { error: "Could not extract text" },
+                { status: 400 }
+            )
+        }
 
-  await prisma.$transaction(
-    chunks.map(chunk =>
-      prisma.$executeRaw`
-        INSERT INTO "DocumentChunk" (id, content, document_id)
-        VALUES (${crypto.randomUUID()}::uuid, ${chunk}, ${document.id}::uuid)
-      `
-    )
-  )
+        // --------------------------------------------------
+        // TEMP USER
+        // --------------------------------------------------
 
-  // -----------------------------
-  // Response
-  // -----------------------------
-  return NextResponse.json({
-    status: "ok",
-    data: {
-      document: {
-        id: document.id,
-        name: file.name,
-        type: file.type,
-        size: file.size,
-        chunks: chunks.length,
-      },
-      processing: {
-        steps: ["uploaded", "parsed", "cleaned", "chunked", "stored"],
-        timestamp: new Date().toISOString(),
-      },
-      stats: {
-        rawLength: rawText.length,
-        cleanLength: cleanText.length,
-      },
-      preview: chunks.slice(0, 3),
-    },
-  })
+        const user = await prisma.user.upsert({
+            where: { email: "dev@test.com" },
+            update: {},
+            create: {
+                id: crypto.randomUUID(),
+                email: "dev@test.com",
+                name: "Dev User",
+            },
+        })
+
+        // --------------------------------------------------
+        // EXTRACT SECTIONS
+        // --------------------------------------------------
+
+        const sections = extractSections(cleanText)
+
+        // --------------------------------------------------
+        // SAVE DOCUMENT + SECTIONS
+        // --------------------------------------------------
+
+        const document = await prisma.document.create({
+            data: {
+                name: file.name,
+                type: file.type,
+                user_id: user.id,
+                sections: {
+                    create: sections.map((s) => ({
+                        type: s.type,
+                        content: s.content,
+                    })),
+                },
+            },
+            include: {
+                sections: true,
+            },
+        })
+
+        // --------------------------------------------------
+        // SECTION-WISE CHUNKING
+        // --------------------------------------------------
+
+        const sectionChunks: {
+            sectionType: SectionType
+            content: string
+        }[] = []
+
+        for (const section of sections) {
+            const chunks = chunkText(section.content)
+
+            for (const chunk of chunks) {
+                sectionChunks.push({
+                    sectionType: section.type,
+                    content: chunk,
+                })
+            }
+        }
+
+        // --------------------------------------------------
+        // RESPONSE
+        // --------------------------------------------------
+
+        return NextResponse.json({
+            status: "ok",
+            textLength: cleanText.length,
+            totalSections: sections.length,
+            totalChunks: sectionChunks.length,
+            data: {
+                documentId: document.id,
+                filename: file.name,
+                sections: document.sections,
+                chunks: sectionChunks,
+            },
+        })
+    } catch (error) {
+        console.error("Upload error:", error)
+
+        return NextResponse.json(
+            { error: "Internal Server Error" },
+            { status: 500 }
+        )
+    }
 }
